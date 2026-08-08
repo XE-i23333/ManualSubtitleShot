@@ -51,9 +51,12 @@ Debug（vs设置为动态链接）与 Release（vs设置为静态链接）需要
 从 [原版果核core-ui Releases](https://github.com/ghboke/core-ui/releases) 下载 `core-ui-v1.7.0-windows-x64.zip`，解压后把 `core-ui-v1.7.0\` 目录放到本仓库根（与 `manualsubtitleshot_coreui.slnx` 同级）即可。包内已含 dynamic（`core-ui.dll` + 导入库）与 static（含 QuickJS / LunaSVG 的 `core-ui.lib`）两套产物。
 
 > **注意（为什么 Release 必须自编 static 库）**：官方预编译包里的 static `core-ui.lib` 是按 **/MD（动态 CRT）** 编译的core-ui代码虽然静态进了 exe，但 MSVC 运行库（vcruntime140.dll / msvcp140.dll 等）仍需目标机器安装 **VC++ Redistributable**，否则启动报"缺少 VCRUNTIME140.dll"。而且它与本仓库 Release 的 /MT 配置不匹配，会直接链接失败（LNK2038 `RuntimeLibrary` 不匹配）。
+> 
 > 版本目录名来自 core-ui 的 `VERSION`（当前 `v1.7.0`），升级 core-ui 后路径相应变化。
+> 
 > 本仓库 Release 目标是**零运行时依赖的单 exe**（/MT 静态 CRT，连 MSVC 运行库也一起编进 exe，不需要 vc_redist），因此改用方式 B 自编 static 库替换。Debug 则用上面方式 A 下载的动态库（core-ui.dll + 导入库）即可，不受影响。
-> 原版Release不支持鼠标微调滑块，mod版加上了该功能
+> 
+> 原版Release不支持用鼠标微调滑块，mod版加上了该功能
 
 
 **方式 B：从源码构建**
