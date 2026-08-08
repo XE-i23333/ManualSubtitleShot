@@ -50,6 +50,7 @@ export default {
     <div class="shell">
     <div class="panel">
       <button id="btnRegion" @click="cmdRegion">框选视频区域（F8）</button>
+      <label class="lbl">{{ regionInfo }}</label>
       <div class="sep"/>
       <div class="row"><label class="lbl">上边距</label><label class="num">{{ topMargin }}px</label></div>
       <input id="slTop" type="range" min="0" max="2000" v-model="topMargin"/>
