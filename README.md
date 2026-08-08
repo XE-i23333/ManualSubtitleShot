@@ -21,6 +21,13 @@
 - **UI 定义内嵌**：`app.uix` 作为 RCDATA 资源编译进 exe，单文件发布
 - **Release 静态链接** core-ui 且 /MT 静态 CRT，输出单 exe，零运行时依赖（无需 vc_redist）
 
+## 使用
+
+1. 启动后按 **F8**，拖拽框选视频字幕区域
+2. 播放视频，在每帧字幕完整时按 **F9** 截图
+3. 调整 上边距/下边距（裁掉固定黑边）与 间隙（字幕行间距），预览实时更新
+4. 可删除误截的帧
+5. 点 **保存 PNG** 导出长图
 
 <table align="center">
   <tr>
@@ -107,14 +114,6 @@ msbuild manualsubtitleshot_coreui.slnx /p:Configuration=Debug /p:Platform=x64
 # Release（静态链接，单文件，无 DLL 依赖，无需 vc_redist）
 msbuild manualsubtitleshot_coreui.slnx /p:Configuration=Release /p:Platform=x64
 ```
-
-## 使用
-
-1. 启动后按 **F8**，拖拽框选视频字幕区域
-2. 播放视频，在每帧字幕完整时按 **F9** 截图
-3. 调整 上边距/下边距（裁掉固定黑边）与 间隙（字幕行间距），预览实时更新
-4. 可删除误截的帧
-5. 点 **保存 PNG** 导出长图
 
 ## 目录结构
 
