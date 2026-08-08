@@ -1,0 +1,90 @@
+<window title="字幕截图拼接" width="1040" height="720" min-width="780" min-height="480" resizable="true" centered="true" frameless="true"/>
+<script>
+export default {
+  data() {
+    return {
+      topMargin: 80,
+      bottomMargin: 40,
+      gap: 0,
+      regionInfo: "未框选视频区域",
+      finalSize: "--",
+      sel: -1,
+      count: 0,
+      items: []
+    };
+  },
+  computed: {
+    hasItems() { return this.items.length > 0; }
+  },
+  methods: {
+    select(i) { this.sel = i; }
+  }
+}
+</script>
+<style>
+  .shell   { flex-direction: row; gap: 0; flex: 1; min-height: 0; background: var(--bg); }
+  .panel   { width: 252; padding: 14px; gap: 10px; background: var(--sidebar-bg); }
+  .title   { font-size: 15px; font-weight: 700; color: var(--fg); }
+  .lbl     { font-size: 12px; color: var(--fg-3); }
+  .num     { width: 46; text-align: right; color: var(--fg); font-size: 12px; }
+  .sep     { height: 1; background: var(--border-subtle); margin: 2px 0; }
+  .row     { flex-direction: row; align-items: center; justify-content: space-between; }
+  .btns    { flex-direction: row; gap: 8px; }
+  .prevbox { flex: 1; min-width: 0; gap: 8px; padding: 10px; }
+  .list    { gap: 4px; flex: 1; min-height: 0; }
+  .itemrow { flex-direction: row; align-items: center; gap: 8px; padding: 3px 6px;
+             border-radius: 4px; }
+  .itemrow.on { background: var(--bg-3); }
+  .thumb   { width: 96; height: 36; object-fit: contain; }
+  .sp      { flex: 1; }
+  button        { padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+  button.danger { background: #ef4444; }
+  button.del    { background: transparent; color: var(--fg-3); padding: 0 6px;
+                  min-height: 20px; font-size: 14px; align-items: center;
+                  justify-content: center; }
+  button.del:hover { color: #ef4444; background: transparent; }
+</style>
+<template>
+  <div>
+    <TitleBar id="titlebar" title="字幕截图拼接"/>
+    <div class="shell">
+    <div class="panel">
+      <button id="btnRegion" @click="cmdRegion">框选视频区域（F8）</button>
+      <div class="sep"/>
+      <div class="row"><label class="lbl">上边距</label><label class="num">{{ topMargin }}px</label></div>
+      <input id="slTop" type="range" min="0" max="2000" v-model="topMargin"/>
+      <div class="row"><label class="lbl">下边距</label><label class="num">{{ bottomMargin }}px</label></div>
+      <input id="slBottom" type="range" min="0" max="2000" v-model="bottomMargin"/>
+      <div class="row"><label class="lbl">间隙</label><label class="num">{{ gap }}px</label></div>
+      <input id="slGap" type="range" min="0" max="80" v-model="gap"/>
+      <div class="sep"/>
+      <div class="row">
+        <button id="btnCapture" @click="cmdCapture">截图（F9）</button>
+        <label class="num" style="width:auto">最终 {{ finalSize }}</label>
+      </div>
+      <div class="btns">
+        <button id="btnSave" @click="cmdSave" :enabled="hasItems" style="flex:1">保存 PNG</button>
+        <button id="btnClear" class="danger" @click="cmdClear" :enabled="hasItems">清空</button>
+      </div>
+      <label class="lbl">共 {{ count }} 张（第 1 张为背景）</label>
+      <div class="sep"/>
+      <ScrollView class="list" id="thumbList" v-if="items.length > 0">
+        <div class="itemrow" v-for="(item, i) in items" :key="item.id"
+             :class="sel == i ? 'on' : ''" @click="select(i)">
+          <img :src="item.thumb" class="thumb"/>
+          <label class="lbl">#{{ item.seq }} {{ item.time }}</label>
+          <div class="sp"/>
+          <button class="del" :id="'del_' + item.id">
+            <svg width="14" height="14" viewBox="0 0 24 24">
+              <path fill="currentColor" d="M10 5H14C14 3.89543 13.1046 3 12 3C10.8954 3 10 3.89543 10 5ZM8.5 5C8.5 3.067 10.067 1.5 12 1.5C13.933 1.5 15.5 3.067 15.5 5H21.25C21.6642 5 22 5.33579 22 5.75C22 6.16421 21.6642 6.5 21.25 6.5H19.9309L18.7589 18.6112C18.5729 20.5334 16.9575 22 15.0263 22H8.97369C7.04254 22 5.42715 20.5334 5.24113 18.6112L4.06908 6.5H2.75C2.33579 6.5 2 6.16421 2 5.75C2 5.33579 2.33579 5 2.75 5H8.5ZM10.5 9.75C10.5 9.33579 10.1642 9 9.75 9C9.33579 9 9 9.33579 9 9.75V17.25C9 17.6642 9.33579 18 9.75 18C10.1642 18 10.5 17.6642 10.5 17.25V9.75ZM14.25 9C14.6642 9 15 9.33579 15 9.75V17.25C15 17.6642 14.6642 18 14.25 18C13.8358 18 13.5 17.6642 13.5 17.25V9.75C13.5 9.33579 13.8358 9 14.25 9ZM6.73416 18.4667C6.84577 19.62 7.815 20.5 8.97369 20.5H15.0263C16.185 20.5 17.1542 19.62 17.2658 18.4667L18.4239 6.5H5.57608L6.73416 18.4667Z"/>
+            </svg>
+          </button>
+        </div>
+      </ScrollView>
+    </div>
+    <div class="prevbox">
+      <gh_img id="preview" v-show="hasItems" style="flex:1"/>
+    </div>
+    </div>
+  </div>
+</template>
