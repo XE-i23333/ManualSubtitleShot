@@ -25,7 +25,7 @@ using namespace Gdiplus;
 static void CrashLog(const char* ctx, PVOID* frames, int n)
 {
     FILE* f = NULL;
-    fopen_s(&f, "crash.log", "a");
+    fopen_s(&f, "subttshot_crash.log", "a");
     if (!f)
         return;
     SYSTEMTIME st;
@@ -72,7 +72,7 @@ static void TermHandler()
     SYSTEMTIME st;
     GetLocalTime(&st);
     FILE* f = NULL;
-    fopen_s(&f, "crash.log", "a");
+    fopen_s(&f, "subttshot_crash.log", "a");
     if (f)
     {
         fprintf(f, "\n[%02d:%02d:%02d.%03d] std::terminate: uncaught C++ exception (tid=%lu)\n",
@@ -139,7 +139,7 @@ static int ThumbResolver(const char* name, const void** out_bytes,
 {
     std::lock_guard<std::mutex> lk(g_blobsMutex);
     auto it = g_blobs.find(name);
-    if (it == g_blobs.end())
+    if (it == g_blobs.end() || it->second.empty())
         return 0;
     *out_bytes = it->second.data();
     *out_size = it->second.size();
@@ -181,11 +181,11 @@ static int g_pushedGap = -1;
 // ---- region overlay ----
 static HBITMAP g_snap = NULL;
 static HBITMAP g_mask = NULL;
-static HBITMAP g_dim = NULL;  // 预合成"压暗快照"（快照+遮罩一次算好，重绘只 BitBlt）
-static HDC g_dimDC = NULL;    // 常驻 DC，重绘期间零分配，避免内存吃紧时创建失败导致闪烁
+static HBITMAP g_dim = NULL;
+static HDC g_dimDC = NULL;
 static HDC g_snapDC = NULL;
 static HPEN g_selPen = NULL;
-static HWND g_regionAppHwnd = NULL;  // 选区期间隐藏的 app 窗口
+static HWND g_regionAppHwnd = NULL;  // 选区期间隐藏主窗口
 static int g_snapW = 0, g_snapH = 0;
 static int g_regOx = 0, g_regOy = 0;
 static bool g_dragging = false;
@@ -379,7 +379,15 @@ static void CopyBitmapRows(Bitmap* dst, Bitmap* src, int srcY, int dstY, int row
 {
     if (rows <= 0)
         return;
-    int w = (int)src->GetWidth();
+    int sw = (int)src->GetWidth();
+    int dw = (int)dst->GetWidth();
+    int sh = (int)src->GetHeight();
+    int dh = (int)dst->GetHeight();
+    if (srcY < 0 || dstY < 0 || srcY + rows > sh || dstY + rows > dh)
+        return;
+    int w = std::min(sw, dw);
+    if (w <= 0)
+        return;
     BitmapData ds, dd;
     if (src->LockBits(&Rect(0, srcY, w, rows), ImageLockModeRead,
                       PixelFormat32bppARGB, &ds) != Ok)
@@ -644,6 +652,7 @@ static int g_previewCacheCount = 0;  // 已拼进缓存的条目数
 static int g_previewCacheMaxW = 0;   // 缓存采用的 maxW（决定缩放比例）
 static int g_previewCacheTop = 0, g_previewCacheBottom = 0, g_previewCacheGap = 0;
 static int g_previewCacheCapH = 0;   // 缓存位图分配的容量高（≥ 实际内容高）
+static int g_previewCacheH = 0;      // 缓存位图的逻辑内容高（≤ CapH，物理高可能更大）
 static std::vector<int> g_cacheStrips;  // 每条目条带像素高（含尾随 gap）
 static bool g_dbgIncrDump = false;   // debug：增量重建后保存 dump_incr.png
 
@@ -657,10 +666,12 @@ static void FreePreviewCache()
     g_previewCacheCount = 0;
     g_previewCacheMaxW = 0;
     g_previewCacheCapH = 0;
+    g_previewCacheH = 0;
     g_cacheStrips.clear();
 }
 
-// 把整张拼接缓存喂给 gh_img_view：begin 重建 + 整体 preview（原版整图推送）
+static std::vector<unsigned char> g_previewPixels;
+
 static void PushCacheToView(Bitmap* full, uint32_t logicalH = 0)
 {
     if (!full || !g_gh || !g_win)
@@ -669,24 +680,65 @@ static void PushCacheToView(Bitmap* full, uint32_t logicalH = 0)
         logicalH = (uint32_t)full->GetHeight();
     if (logicalH > (uint32_t)full->GetHeight())
         logicalH = (uint32_t)full->GetHeight();
-    BitmapData data;
-    if (full->LockBits(&Rect(0, 0, (int)full->GetWidth(), (int)full->GetHeight()),
-                       ImageLockModeRead, PixelFormat32bppARGB, &data) == Ok)
+    const int fw = (int)full->GetWidth();
+    const int fh = (int)logicalH;
+    const int kMaxTexDim = 16000;
+    double scale = 1.0;
+    if (fw > kMaxTexDim || fh > kMaxTexDim)
+        scale = (double)kMaxTexDim / std::max(fw, fh);
+    Bitmap* src = full;
+    Bitmap* scaled = NULL;
+    if (scale < 1.0)
     {
-        UiGhImgViewInfo info{};
-        info.full_width = (uint32_t)full->GetWidth();
-        info.full_height = logicalH;
-        info.tile_size = 256;
-        info.levels = 1;
-        info.keep_preview = 0;
-        ui_gh_img_view_begin(g_gh, g_win, &info);
-        ui_gh_img_view_set_preview(g_gh, g_win, data.Scan0,
-                                   (uint32_t)full->GetWidth(),
-                                   logicalH,
-                                   (uint32_t)data.Stride);
-        ui_gh_img_view_fit(g_gh);
-        full->UnlockBits(&data);
+        int sw = std::max(1, (int)(fw * scale));
+        int sh = std::max(1, (int)(fh * scale));
+        scaled = new Bitmap(sw, sh, PixelFormat32bppARGB);
+        {
+            Graphics g(scaled);
+            g.SetInterpolationMode(InterpolationModeBilinear);
+            g.DrawImage(full, RectF(0, 0, (REAL)sw, (REAL)sh),
+                        0, 0, (REAL)fw, (REAL)fh, UnitPixel);
+        }
+        src = scaled;
+        logicalH = (uint32_t)sh;
     }
+    BitmapData data;
+    if (src->LockBits(&Rect(0, 0, (int)src->GetWidth(), (int)src->GetHeight()),
+                      ImageLockModeRead, PixelFormat32bppARGB, &data) == Ok)
+    {
+        const int ph = (int)src->GetHeight();
+        int stride = data.Stride;
+        BYTE* sp = (BYTE*)data.Scan0;
+        if (stride < 0)
+        {
+            sp += (ph - 1) * stride;
+            stride = -stride;
+        }
+        if (stride > 0 && ph > 0)
+        {
+            size_t need = (size_t)ph * (size_t)stride;
+            if (g_previewPixels.size() < need)
+                g_previewPixels.resize(need);
+            BYTE* dp = g_previewPixels.data();
+            for (int y = 0; y < ph; y++)
+                memcpy(dp + (size_t)y * stride, sp + (size_t)y * stride, (size_t)stride);
+            UiGhImgViewInfo info{};
+            info.full_width = (uint32_t)src->GetWidth();
+            info.full_height = logicalH;
+            info.tile_size = 256;
+            info.levels = 1;
+            info.keep_preview = 0;
+            ui_gh_img_view_begin(g_gh, g_win, &info);
+            ui_gh_img_view_set_preview(g_gh, g_win, g_previewPixels.data(),
+                                       (uint32_t)src->GetWidth(),
+                                       logicalH,
+                                       (uint32_t)stride);
+            ui_gh_img_view_fit(g_gh);
+        }
+        src->UnlockBits(&data);
+    }
+    if (scaled)
+        delete scaled;
 }
 
 // 拖动边距/间隔滑块时的增量重建
@@ -742,7 +794,6 @@ static void PushPreviewIncremental()
     int dropTop = std::max(0, (int)topD);
     int dropBottom = std::max(0, (int)bottomD);
     // 每条目内容块的位移方向
-    // 混合方向时相邻条目可能互相覆盖源区，回退全量重建
     bool anyUp = false, anyDown = false;
     for (int i = 1; i < (int)n; i++)
     {
@@ -835,6 +886,7 @@ if (gapRows > 0)
         catch (...) {}
     }
     g_cacheStrips = newStrips;
+    g_previewCacheH = newH;
     g_previewCacheTop = g_topMargin;
     g_previewCacheBottom = g_bottomMargin;
     g_previewCacheGap = g_gap;
@@ -865,77 +917,114 @@ static void PushPreview(int deletedAt)
         marginsSame && deletedAt >= 0 &&
         (g_previewCacheCount == (int)g_items.size() + 1) &&
         (g_cacheStrips.size() == (size_t)g_previewCacheCount);
+    try
+    {
     if (appendable)
     {
-        // 增量
+        // 增量：复用容量，零分配；容量不足时才分配新位图
         Bitmap* lastF = ItemFrame(last);
-        int oldH = g_previewCache->GetHeight();
+        int oldH = g_previewCacheH;
         int addH = StripPxH(last->w, last->h, false, scale);
         int newH = oldH + addH;
-        Bitmap* nb = new Bitmap(newW, newH, PixelFormat32bppARGB);
-        CopyBitmapRows(nb, g_previewCache, 0, 0, oldH);
-        if (addH > 0 && lastF)
+        if (newH <= g_previewCacheCapH && newW == (int)g_previewCache->GetWidth())
         {
-            Graphics g(nb);
-            g.SetInterpolationMode(InterpolationModeBilinear);
-            int sh = last->h - g_topMargin - g_bottomMargin;
-            double sw = last->w * scale;
-            double sH = sh * scale;
-            g.DrawImage(lastF, RectF((REAL)((newW - sw) / 2), (REAL)oldH,
-                                     (REAL)sw, (REAL)sH),
-                        0, (REAL)g_topMargin, (REAL)lastF->GetWidth(), (REAL)sh,
-                        UnitPixel);
+            if (addH > 0 && lastF)
+            {
+                Graphics g(g_previewCache);
+                g.SetInterpolationMode(InterpolationModeBilinear);
+                int sh = last->h - g_topMargin - g_bottomMargin;
+                double sw = last->w * scale;
+                double sH = sh * scale;
+                g.DrawImage(lastF, RectF((REAL)((newW - sw) / 2), (REAL)oldH,
+                                         (REAL)sw, (REAL)sH),
+                            0, (REAL)g_topMargin, (REAL)lastF->GetWidth(), (REAL)sh,
+                            UnitPixel);
+            }
+            g_cacheStrips.push_back(addH);
+            full = g_previewCache;   // 复用现有位图，不分配
+            g_previewCacheH = newH;
         }
-        delete g_previewCache;
-        g_previewCache = NULL;
-        g_cacheStrips.push_back(addH);
-        full = nb;
+        else
+        {
+            Bitmap* nb = new Bitmap(newW, newH, PixelFormat32bppARGB);
+            CopyBitmapRows(nb, g_previewCache, 0, 0, oldH);
+            if (addH > 0 && lastF)
+            {
+                Graphics g(nb);
+                g.SetInterpolationMode(InterpolationModeBilinear);
+                int sh = last->h - g_topMargin - g_bottomMargin;
+                double sw = last->w * scale;
+                double sH = sh * scale;
+                g.DrawImage(lastF, RectF((REAL)((newW - sw) / 2), (REAL)oldH,
+                                         (REAL)sw, (REAL)sH),
+                            0, (REAL)g_topMargin, (REAL)lastF->GetWidth(), (REAL)sh,
+                            UnitPixel);
+            }
+            delete g_previewCache;
+            g_previewCache = NULL;
+            g_cacheStrips.push_back(addH);
+            full = nb;
+            g_previewCacheH = newH;
+        }
     }
     else if (deletable)
     {
         int k = deletedAt;
-        int oldH = g_previewCache->GetHeight();
+        int oldH = g_previewCacheH;
         int stripK = g_cacheStrips[k];
         int offK = 0;
         for (int t = 0; t < k; t++)
             offK += g_cacheStrips[t];
         int newFirstStrip = (k == 0) ? StripPxH(g_items[0]->w, g_items[0]->h, true, scale) : 0;
         int newH = oldH - stripK + (k == 0 ? newFirstStrip - stripK : 0);
-        Bitmap* nb = new Bitmap(newW, std::max(1, newH), PixelFormat32bppARGB);
-        if (k > 0)
+        if (k > 0 && newW == (int)g_previewCache->GetWidth() && newH > 0 &&
+            newH <= g_previewCacheCapH)
         {
-            CopyBitmapRows(nb, g_previewCache, 0, 0, offK);
-            CopyBitmapRows(nb, g_previewCache, offK + stripK, offK,
-                           oldH - offK - stripK);
+            ShiftRowsInPlace(g_previewCache, offK + stripK, offK,
+                             oldH - offK - stripK);
+            g_cacheStrips.erase(g_cacheStrips.begin() + k);
+            full = g_previewCache;   // 复用现有位图，不分配
+            g_previewCacheH = newH;
         }
         else
         {
-            // 删除第 0 张（背景）后：旧条带向上平移 newFirstStrip - stripK，
-            // 目标起点必须是 newFirstStrip - stripK（等于 newH - (oldH-stripK)），
-            // 否则会越界写入 nb（终点 = newH + stripK）。
-            int dstY = newFirstStrip - stripK;
-            if (dstY < 0) dstY = 0;
-            CopyBitmapRows(nb, g_previewCache, stripK, dstY,
-                           oldH - stripK - (dstY));
-            if (newFirstStrip > 0)
+            Bitmap* nb = new Bitmap(newW, std::max(1, newH), PixelFormat32bppARGB);
+            if (k > 0)
             {
-                Bitmap* f0 = ItemFrame(g_items[0]);
-                if (f0)
+                CopyBitmapRows(nb, g_previewCache, 0, 0, offK);
+                CopyBitmapRows(nb, g_previewCache, offK + stripK, offK,
+                               oldH - offK - stripK);
+            }
+            else
+            {
+                int dstY = newFirstStrip - stripK;
+                if (dstY < 0) dstY = 0;
+                int nbH = std::max(1, newH);
+                int rows = oldH - stripK - dstY;
+                if (rows > nbH - dstY)
+                    rows = std::max(0, nbH - dstY);
+                CopyBitmapRows(nb, g_previewCache, stripK, dstY, rows);
+                if (newFirstStrip > 0)
                 {
-                    Graphics g(nb);
-                    g.SetInterpolationMode(InterpolationModeBilinear);
-                    double bw = f0->GetWidth() * scale;
-                    double bh = f0->GetHeight() * scale;
-                    g.DrawImage(f0, (REAL)((newW - bw) / 2), 0.0f, (REAL)bw, (REAL)bh);
+                    Bitmap* f0 = ItemFrame(g_items[0]);
+                    if (f0)
+                    {
+                        Graphics g(nb);
+                        g.SetInterpolationMode(InterpolationModeBilinear);
+                        double bw = f0->GetWidth() * scale;
+                        double bh = f0->GetHeight() * scale;
+                        g.DrawImage(f0, (REAL)((newW - bw) / 2), 0.0f, (REAL)bw, (REAL)bh);
+                    }
                 }
             }
+            delete g_previewCache;
+            g_previewCache = NULL;
+            g_cacheStrips.erase(g_cacheStrips.begin() + k);
+            if (k == 0 && !g_cacheStrips.empty())
+                g_cacheStrips[0] = newFirstStrip;
+            full = nb;
+            g_previewCacheH = newH;
         }
-        delete g_previewCache;
-        g_previewCache = NULL;
-        g_cacheStrips.erase(g_cacheStrips.begin() + k);
-        if (k == 0 && !g_cacheStrips.empty())
-            g_cacheStrips[0] = newFirstStrip;
-        full = nb;
     }
     else
     {
@@ -943,11 +1032,13 @@ static void PushPreview(int deletedAt)
         g_previewCache = NULL;
         full = BuildStitched(960, InterpolationModeBilinear);
         g_cacheStrips.clear();
+        if (full)
+            g_previewCacheH = (int)full->GetHeight();
     }
     if (!full)
         return;
-    g_previewCache = full;   // 先接管新指针：后面任何异常都不会让 g_previewCache 悬垂
-    PushCacheToView(full);
+    g_previewCache = full;
+    PushCacheToView(full, (uint32_t)g_previewCacheH);
     g_previewCacheCapH = (int)full->GetHeight();
     g_previewCacheCount = (int)g_items.size();
     {
@@ -966,6 +1057,12 @@ static void PushPreview(int deletedAt)
     g_previewCacheTop = g_topMargin;
     g_previewCacheBottom = g_bottomMargin;
     g_previewCacheGap = g_gap;
+    }
+    catch (...)
+    {
+        FreePreviewCache();
+        ui_gh_img_view_clear(g_gh);
+    }
 }
 
 // ---------- actions ----------
@@ -1038,8 +1135,7 @@ static void DoCapture()
 
     PushItems();
     PushPreview();
-    // 截图峰值后立刻把工作集页面交还系统，避免依赖 Windows 2 秒左右的
-    // 工作集修剪延迟（任务管理器内存列才能即时回落）。
+    // 截图峰值后立刻把工作集页面交还系统，避免依赖 Windows 2 秒左右的工作集修剪延迟
     GdiFlush();
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
@@ -1265,7 +1361,7 @@ HDC hdc = BeginPaint(hwnd, &ps);
             DeleteObject(g_selPen);
             g_selPen = NULL;
         }
-        // 恢复被隐藏的 app 窗口
+        // 恢复被隐藏的主窗口
         if (g_regionAppHwnd && IsWindow(g_regionAppHwnd))
         {
             if (!IsWindowVisible(g_regionAppHwnd))
@@ -1405,12 +1501,48 @@ static void ApplySystemTheme()
 static WNDPROC g_origWndProc = NULL;
 
 #define TIMER_MARGIN 1
+#define WM_APP_DELETE  (WM_APP + 1)
+#define WM_APP_CAPTURE (WM_APP + 2)
+#define WM_APP_CLEAR   (WM_APP + 3)
 
 static uint64_t g_lastMarginTs = 0;
 static bool g_marginTimerOn = false;
+static LRESULT SafeCallCoreWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    __try
+    {
+        return g_origWndProc
+                ? g_origWndProc(hwnd, msg, wp, lp)
+                : DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        char buf[192];
+        sprintf_s(buf, "AV in core-ui WndProc (msg=0x%X, w=%llu, l=%llu, code=0x%08X) - swallowed",
+                  msg, (unsigned long long)wp, (unsigned long long)lp,
+                  (unsigned)GetExceptionCode());
+        CrashLogNow(buf);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
 
 static LRESULT CALLBACK ThemeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+if (msg == WM_APP_DELETE)
+    {
+        Guarded("EXCEPTION in deferred delete", [wp]() { DeleteItemById((int)(intptr_t)wp); });
+        return 0;
+    }
+    if (msg == WM_APP_CAPTURE)
+    {
+        Guarded("EXCEPTION in deferred capture", DoCapture);
+        return 0;
+    }
+    if (msg == WM_APP_CLEAR)
+    {
+        Guarded("EXCEPTION in deferred clear", DoClear);
+        return 0;
+    }
     if (msg == WM_TIMER && wp == TIMER_MARGIN)
     {
         KillTimer(hwnd, TIMER_MARGIN);
@@ -1419,7 +1551,6 @@ static LRESULT CALLBACK ThemeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             if (GetTickCount64() - g_lastMarginTs >= 250)
             {
-                // 已停止拖动：先保存增量重建现场，再全量精确重建并重编码缩略图
                 if (g_dbgIncrDump)
                 {
                     g_dbgIncrDump = false;
@@ -1448,9 +1579,7 @@ static LRESULT CALLBACK ThemeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     LRESULT r;
     try
     {
-        r = g_origWndProc
-                ? g_origWndProc(hwnd, msg, wp, lp)
-                : DefWindowProcW(hwnd, msg, wp, lp);
+        r = SafeCallCoreWndProc(hwnd, msg, wp, lp);
     }
     catch (const std::exception& e)
     {
@@ -1513,11 +1642,20 @@ static void ScheduleMarginRebuild()
 static void OnSliderTop(UiWidget, float v, void*)   { g_topMargin = (int)v;  PushMarginState(); ScheduleMarginRebuild(); }
 static void OnSliderBottom(UiWidget, float v, void*) { g_bottomMargin = (int)v; PushMarginState(); ScheduleMarginRebuild(); }
 static void OnSliderGap(UiWidget, float v, void*)    { g_gap = (int)v;       PushMarginState(); ScheduleMarginRebuild(); }
-
 static void OnBtnRegion(UiWidget, void*)  { Guarded("EXCEPTION in OnBtnRegion", OpenRegionSelect); }
-static void OnBtnCapture(UiWidget, void*) { Guarded("EXCEPTION in OnBtnCapture", DoCapture); }
+static void OnBtnCapture(UiWidget, void*)
+{
+    HWND hw = (HWND)ui_window_hwnd(g_win);
+    if (hw)
+        PostMessageW(hw, WM_APP_CAPTURE, 0, 0);
+}
 static void OnBtnSave(UiWidget, void*)    { Guarded("EXCEPTION in OnBtnSave", DoSave); }
-static void OnBtnClear(UiWidget, void*)   { Guarded("EXCEPTION in OnBtnClear", DoClear); }
+static void OnBtnClear(UiWidget, void*)
+{
+    HWND hw = (HWND)ui_window_hwnd(g_win);
+    if (hw)
+        PostMessageW(hw, WM_APP_CLEAR, 0, 0);
+}
 
 static void OnStaticMount(UiPage, UiWidget w, void* ud)
 {
@@ -1536,7 +1674,16 @@ static void OnStaticMount(UiPage, UiWidget w, void* ud)
 static void OnDelClicked(UiWidget, void* ud)
 {
     int id = (int)(intptr_t)ud;
-    Guarded("EXCEPTION in OnDelClicked", [id]() { DeleteItemById(id); });
+    static ULONGLONG sLastDelMs = 0;
+    static int sLastDelId = -1;
+    ULONGLONG now = GetTickCount64();
+    if (id == sLastDelId && now - sLastDelMs < 500)
+        return;
+    sLastDelMs = now;
+    sLastDelId = id;
+    HWND hw = (HWND)ui_window_hwnd(g_win);
+    if (hw)
+        PostMessageW(hw, WM_APP_DELETE, (WPARAM)(intptr_t)id, 0);
 }
 
 static void OnDelMount(UiPage, UiWidget w, void* ud)
