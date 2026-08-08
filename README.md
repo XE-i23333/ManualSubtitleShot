@@ -117,10 +117,10 @@ msbuild manualsubtitleshot_coreui.slnx /p:Configuration=Release /p:Platform=x64
 
 ```
 manualsubtitleshot_coreui/
-├── main.cpp                        # 全部应用逻辑
+├── main.cpp                        # 程序逻辑
 ├── app.uix                         # UI
 ├── app.manifest                    # 程序清单（DPI PerMonitorV2、Common-Controls）
-├── manualsubtitleshot_coreui.rc    # 资源脚本（用于内嵌 app.uix）
+├── manualsubtitleshot_coreui.rc    # 用于内嵌 app.uix
 ├── resource.h
 ├── manualsubtitleshot_coreui.vcxproj
 └── manualsubtitleshot_coreui.slnx
