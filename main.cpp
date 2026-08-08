@@ -887,6 +887,7 @@ static void PushPreview(int deletedAt)
                         UnitPixel);
         }
         delete g_previewCache;
+        g_previewCache = NULL;
         g_cacheStrips.push_back(addH);
         full = nb;
     }
@@ -909,8 +910,13 @@ static void PushPreview(int deletedAt)
         }
         else
         {
-            CopyBitmapRows(nb, g_previewCache, stripK, newFirstStrip,
-                           oldH - stripK);
+            // 删除第 0 张（背景）后：旧条带向上平移 newFirstStrip - stripK，
+            // 目标起点必须是 newFirstStrip - stripK（等于 newH - (oldH-stripK)），
+            // 否则会越界写入 nb（终点 = newH + stripK）。
+            int dstY = newFirstStrip - stripK;
+            if (dstY < 0) dstY = 0;
+            CopyBitmapRows(nb, g_previewCache, stripK, dstY,
+                           oldH - stripK - (dstY));
             if (newFirstStrip > 0)
             {
                 Bitmap* f0 = ItemFrame(g_items[0]);
@@ -925,6 +931,7 @@ static void PushPreview(int deletedAt)
             }
         }
         delete g_previewCache;
+        g_previewCache = NULL;
         g_cacheStrips.erase(g_cacheStrips.begin() + k);
         if (k == 0 && !g_cacheStrips.empty())
             g_cacheStrips[0] = newFirstStrip;
@@ -933,13 +940,14 @@ static void PushPreview(int deletedAt)
     else
     {
         delete g_previewCache;
+        g_previewCache = NULL;
         full = BuildStitched(960, InterpolationModeBilinear);
         g_cacheStrips.clear();
     }
     if (!full)
         return;
+    g_previewCache = full;   // 先接管新指针：后面任何异常都不会让 g_previewCache 悬垂
     PushCacheToView(full);
-    g_previewCache = full;
     g_previewCacheCapH = (int)full->GetHeight();
     g_previewCacheCount = (int)g_items.size();
     {
