@@ -53,11 +53,11 @@ export default {
       <label class="lbl">{{ regionInfo }}</label>
       <div class="sep"/>
       <div class="row"><label class="lbl">上边距</label><label class="num">{{ topMargin }}px</label></div>
-      <input id="slTop" type="range" min="0" max="2000" v-model="topMargin"/>
+      <input id="slTop" type="range" min="0" max="2000" step="1" v-model="topMargin"/>
       <div class="row"><label class="lbl">下边距</label><label class="num">{{ bottomMargin }}px</label></div>
-      <input id="slBottom" type="range" min="0" max="2000" v-model="bottomMargin"/>
+      <input id="slBottom" type="range" min="0" max="2000" step="1" v-model="bottomMargin"/>
       <div class="row"><label class="lbl">间隙</label><label class="num">{{ gap }}px</label></div>
-      <input id="slGap" type="range" min="0" max="80" v-model="gap"/>
+      <input id="slGap" type="range" min="0" max="80" step="1" v-model="gap"/>
       <div class="sep"/>
       <div class="row">
         <button id="btnCapture" @click="cmdCapture">截图（F9）</button>
