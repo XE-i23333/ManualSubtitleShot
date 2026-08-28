@@ -12,6 +12,7 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <algorithm>
 #include <exception>
 
 using namespace Gdiplus;
@@ -20,8 +21,7 @@ using namespace Gdiplus;
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dbghelp.lib")
 
-// ---------- crash diagnostics ----------
-
+//crash diagnostics
 static void CrashLog(const char* ctx, PVOID* frames, int n)
 {
     FILE* f = NULL;
@@ -34,8 +34,15 @@ static void CrashLog(const char* ctx, PVOID* frames, int n)
             (int)st.wSecond, (int)st.wMilliseconds, ctx);
     if (frames && n > 0)
     {
+        const unsigned long long base = (unsigned long long)GetModuleHandleW(NULL);
+        fprintf(f, "  exe base=%p\n", (void*)base);
         for (int i = 0; i < n; i++)
-            fprintf(f, "  %p\n", frames[i]);
+        {
+            const unsigned long long a = (unsigned long long)frames[i];
+            fprintf(f, "  %p  RVA+0x%llX%s\n", frames[i],
+                    a >= base ? (unsigned long long)(a - base) : a,
+                    a >= base && a - base < 0x3000000ULL ? "" : "  [sys]");
+        }
     }
     fputs("\n", f);
     fclose(f);
@@ -84,6 +91,18 @@ static void TermHandler()
         if (GlobalMemoryStatusEx(&ms))
             fprintf(f, "  sys mem: load=%u%% avail=%lluMB\n", ms.dwMemoryLoad,
                     (unsigned long long)(ms.ullAvailPhys >> 20));
+        try
+        {
+            std::rethrow_exception(std::current_exception());
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(f, "  exception type: %s\n  what: %s\n", typeid(e).name(), e.what());
+        }
+        catch (...)
+        {
+            fprintf(f, "  exception type: (unknown)\n");
+        }
         fclose(f);
     }
     CrashLogNow("std::terminate: uncaught C++ exception");
@@ -96,7 +115,7 @@ static void InvalidParamHandler(const wchar_t*, const wchar_t*, const wchar_t*,
     CrashLogNow("_invalid_parameter (returning, app continues)");
 }
 
-// ---------- state ----------
+//state
 
 enum
 {
@@ -133,6 +152,10 @@ static UiWidget g_gh = 0;
 static std::vector<Item*> g_items;
 static std::map<std::string, std::vector<unsigned char>> g_blobs;
 static std::mutex g_blobsMutex;
+
+static std::map<std::string, std::vector<unsigned char>> g_blobsTrash;
+static ULONGLONG g_blobsTrashTs = 0;
+static std::mutex g_blobsTrashMutex;
 
 static int ThumbResolver(const char* name, const void** out_bytes,
                          size_t* out_size, void* userdata)
@@ -178,7 +201,7 @@ static int g_pushedTop = -1;
 static int g_pushedBottom = -1;
 static int g_pushedGap = -1;
 
-// ---- region overlay ----
+//region overlay
 static HBITMAP g_snap = NULL;
 static HBITMAP g_mask = NULL;
 static HBITMAP g_dim = NULL;
@@ -193,7 +216,7 @@ static POINT g_selStart = {0, 0}, g_selCur = {0, 0};
 static RECT g_newRegion = {0, 0, 0, 0};
 static bool g_newRegionValid = false;
 
-// ---------- helpers ----------
+//helpers
 
 static std::string W2U(const wchar_t* s)
 {
@@ -202,8 +225,9 @@ static std::string W2U(const wchar_t* s)
     int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
     if (n <= 1)
         return std::string();
-    std::string out(static_cast<size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s, -1, &out[0], n, NULL, NULL);
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s, -1, out.data(), n, NULL, NULL);
+    out.resize(static_cast<size_t>(n - 1));
     return out;
 }
 
@@ -214,8 +238,9 @@ static std::wstring ToWide(const char* s)
     int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
     if (n <= 1)
         return std::wstring();
-    std::wstring out(static_cast<size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s, -1, &out[0], n);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), n);
+    out.resize(static_cast<size_t>(n - 1));
     return out;
 }
 
@@ -248,7 +273,10 @@ static std::string JsonStr(const wchar_t* s)
 static void SetState(const char* key, const std::string& json)
 {
     if (g_page)
-        ui_page_set_json(g_page, key, json.c_str());
+    {
+        try { ui_page_set_json(g_page, key, json.c_str()); }
+        catch (...) { CrashLogNow("exception in ui_page_set_json"); }
+    }
 }
 
 static void SetRegionInfo(const wchar_t* fmt, ...)
@@ -261,7 +289,17 @@ static void SetRegionInfo(const wchar_t* fmt, ...)
     SetState("regionInfo", JsonStr(buf));
 }
 
-// ---------- capture / stitch ----------
+static void ResetUiInteractionStateBeforeRebuild()
+{
+    if (!g_win)
+        return;
+    HWND hwnd = (HWND)ui_window_hwnd(g_win);
+    if (hwnd)
+        SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
+    ui_debug_blur(g_win);
+}
+
+//capture/stitch
 
 static Bitmap* CaptureScreenRect(int x, int y, int w, int h)
 {
@@ -329,17 +367,23 @@ static Bitmap* ItemFrame(Item* it)
         s->Release();
         return NULL;
     }
-    Bitmap dec(s);
-    if (dec.GetLastStatus() != Ok)
+    bool decodeOk = false;
     {
-        s->Release();
-        return NULL;
+        Bitmap dec(s);
+        if (dec.GetLastStatus() != Ok)
+            decodeOk = false;
+        else
+        {
+            Graphics gg(g_frame);
+            gg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            gg.Clear(Color(255, 255, 255, 255));
+            gg.DrawImage(&dec, 0, 0, it->w, it->h);
+            decodeOk = true;
+        }
     }
-    Graphics gg(g_frame);
-    gg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-    gg.Clear(Color(255, 255, 255, 255));
-    gg.DrawImage(&dec, 0, 0, it->w, it->h);
     s->Release();
+    if (!decodeOk)
+        return NULL;
     g_frameW = it->w;
     g_frameH = it->h;
     return g_frame;
@@ -502,7 +546,7 @@ static Bitmap* BuildStitched(int capW, InterpolationMode interp = InterpolationM
     return res;
 }
 
-// ---------- UI push ----------
+//UI push
 
 // 最终成品图尺寸
 static void PushFinalSize()
@@ -535,6 +579,9 @@ static void PushMarginState()
 static void OnDelMount(UiPage, UiWidget w, void* ud);
 static void MakeThumbPng(Item* it, std::string& out_name,
                          std::vector<unsigned char>& out_bytes);
+extern HWND g_msgWnd;
+#define WM_APP_DELETE  (WM_APP + 1)
+#define WM_APP_REHOVER (WM_APP + 4)
 
 static void PushItems(bool forceAll = false)
 {
@@ -547,7 +594,14 @@ static void PushItems(bool forceAll = false)
         {
             std::string name;
             std::vector<unsigned char> bytes;
-            MakeThumbPng(it, name, bytes);   // 注册缩略图 blob，src 带版本号
+            try
+            {
+                MakeThumbPng(it, name, bytes);   // 注册缩略图 blob，src 带版本号
+            }
+            catch (...)
+            {
+                // 缩略图生成失败（如内存紧张）时跳过，不中断列表更新
+            }
         }
         live.push_back(it->thumbName);
         if (i)
@@ -562,21 +616,31 @@ static void PushItems(bool forceAll = false)
         j += ",\"thumb\":\"" + it->thumbName + "\"}";
     }
     j += "]";
-    // 清理不再被任何条目引用的旧缩略图 blob
+    // 延迟清理：不再直接 erase，而是把旧 blob 移入 trash，2 秒后再真正释放，
+    // 避免 core-ui 异步渲染线程仍持有旧缩略图指针时发生悬空访问。
     {
         std::lock_guard<std::mutex> lk(g_blobsMutex);
+        std::lock_guard<std::mutex> tlk(g_blobsTrashMutex);
+        if (g_blobsTrash.empty())
+            g_blobsTrashTs = GetTickCount64();
         for (auto it = g_blobs.begin(); it != g_blobs.end(); )
         {
             bool ref = false;
             for (size_t i = 0; i < live.size() && !ref; i++)
                 ref = (live[i] == it->first);
             if (ref)
+            {
                 ++it;
+            }
             else
+            {
+                g_blobsTrash[it->first] = std::move(it->second);
                 it = g_blobs.erase(it);
+            }
         }
     }
     g_itemsJson = j;
+    ResetUiInteractionStateBeforeRebuild();
     SetState("items", g_itemsJson);
     char cnt[32];
     sprintf_s(cnt, "%d", (int)g_items.size());
@@ -589,6 +653,10 @@ static void PushItems(bool forceAll = false)
         ui_page_on_widget_mount(g_page, idBuf, OnDelMount,
                                 (void*)(intptr_t)g_items[i]->id);
     }
+    // 注意：不能在此同步清焦点——core-ui 会对焦点槽里刚被 SetState 销毁的
+    // 旧 widget 直接 RefreshCssState 而悬垂崩溃。改为下方异步 rehover。
+    if (g_msgWnd)
+        PostMessageW(g_msgWnd, WM_APP_REHOVER, 0, 0);
     g_pushedCount = (int)g_items.size();
 }
 
@@ -672,6 +740,32 @@ static void FreePreviewCache()
 
 static std::vector<unsigned char> g_previewPixels;
 
+// RAII: 确保 LockBits 后即使异常也会 UnlockBits，防止 GDI+ 堆损坏
+struct BitmapLockGuard
+{
+    Bitmap* bm;
+    BitmapData* data;
+    bool locked;
+    BitmapLockGuard(Bitmap* b, BitmapData* d) : bm(b), data(d), locked(false) {}
+    ~BitmapLockGuard()
+    {
+        Unlock();
+    }
+    void Unlock()
+    {
+        if (locked && bm)
+        {
+            bm->UnlockBits(data);
+            locked = false;
+        }
+    }
+    bool Lock(const Rect& rect, ImageLockMode mode, PixelFormat fmt)
+    {
+        locked = (bm->LockBits(&rect, mode, fmt, data) == Ok);
+        return locked;
+    }
+};
+
 static void PushCacheToView(Bitmap* full, uint32_t logicalH = 0)
 {
     if (!full || !g_gh || !g_win)
@@ -702,41 +796,62 @@ static void PushCacheToView(Bitmap* full, uint32_t logicalH = 0)
         src = scaled;
         logicalH = (uint32_t)sh;
     }
+
     BitmapData data;
-    if (src->LockBits(&Rect(0, 0, (int)src->GetWidth(), (int)src->GetHeight()),
-                      ImageLockModeRead, PixelFormat32bppARGB, &data) == Ok)
+    BitmapLockGuard lockGuard(src, &data);
+    if (!lockGuard.Lock(Rect(0, 0, (int)src->GetWidth(), (int)src->GetHeight()),
+                        ImageLockModeRead, PixelFormat32bppARGB))
     {
-        const int ph = (int)src->GetHeight();
-        int stride = data.Stride;
-        BYTE* sp = (BYTE*)data.Scan0;
-        if (stride < 0)
-        {
-            sp += (ph - 1) * stride;
-            stride = -stride;
-        }
-        if (stride > 0 && ph > 0)
-        {
-            size_t need = (size_t)ph * (size_t)stride;
-            if (g_previewPixels.size() < need)
-                g_previewPixels.resize(need);
-            BYTE* dp = g_previewPixels.data();
-            for (int y = 0; y < ph; y++)
-                memcpy(dp + (size_t)y * stride, sp + (size_t)y * stride, (size_t)stride);
-            UiGhImgViewInfo info{};
-            info.full_width = (uint32_t)src->GetWidth();
-            info.full_height = logicalH;
-            info.tile_size = 256;
-            info.levels = 1;
-            info.keep_preview = 0;
-            ui_gh_img_view_begin(g_gh, g_win, &info);
-            ui_gh_img_view_set_preview(g_gh, g_win, g_previewPixels.data(),
-                                       (uint32_t)src->GetWidth(),
-                                       logicalH,
-                                       (uint32_t)stride);
-            ui_gh_img_view_fit(g_gh);
-        }
-        src->UnlockBits(&data);
+        if (scaled)
+            delete scaled;
+        return;
     }
+
+    const int ph = (int)src->GetHeight();
+    int stride = data.Stride;
+    BYTE* sp = (BYTE*)data.Scan0;
+    if (stride < 0)
+    {
+        sp += (ph - 1) * stride;
+        stride = -stride;
+    }
+    if (stride > 0 && ph > 0)
+    {
+        size_t need = (size_t)ph * (size_t)stride;
+        if (g_previewPixels.size() < need)
+        {
+            try { g_previewPixels.resize(need); }
+            catch (...)
+            {
+                lockGuard.Unlock();
+                if (scaled)
+                    delete scaled;
+                return;
+            }
+        }
+        BYTE* dp = g_previewPixels.data();
+        for (int y = 0; y < ph; y++)
+            memcpy(dp + (size_t)y * stride, sp + (size_t)y * stride, (size_t)stride);
+    }
+    lockGuard.Unlock();
+
+    UiGhImgViewInfo info{};
+    info.full_width = (uint32_t)src->GetWidth();
+    info.full_height = logicalH;
+    info.tile_size = 256;
+    info.levels = 1;
+    info.keep_preview = 0;
+    try
+    {
+        ui_gh_img_view_begin(g_gh, g_win, &info);
+        ui_gh_img_view_set_preview(g_gh, g_win, g_previewPixels.data(),
+                                   (uint32_t)src->GetWidth(),
+                                   logicalH,
+                                   (uint32_t)stride);
+        ui_gh_img_view_fit(g_gh);
+    }
+    catch (...) { CrashLogNow("exception in PushCacheToView ui_gh_img_view_*"); }
+
     if (scaled)
         delete scaled;
 }
@@ -914,11 +1029,21 @@ static void PushPreview(int deletedAt)
         (g_previewCacheCount + 1 == (int)g_items.size()) &&
         (last->w <= g_previewCacheMaxW);
     const bool deletable = g_previewCache &&
-        marginsSame && deletedAt >= 0 &&
+        marginsSame && deletedAt >= 0 && deletedAt < (int)g_cacheStrips.size() &&
         (g_previewCacheCount == (int)g_items.size() + 1) &&
-        (g_cacheStrips.size() == (size_t)g_previewCacheCount);
+        (g_cacheStrips.size() == (size_t)g_previewCacheCount) &&
+        g_previewCacheH > 0;
     try
     {
+    // 全量重建（缓存不再可用/状态不一致时的安全回退）
+    auto fullRebuild = [&]() {
+        delete g_previewCache;
+        g_previewCache = NULL;
+        full = BuildStitched(960, InterpolationModeBilinear);
+        g_cacheStrips.clear();
+        if (full)
+            g_previewCacheH = (int)full->GetHeight();
+    };
     if (appendable)
     {
         // 增量：复用容量，零分配；容量不足时才分配新位图
@@ -977,7 +1102,11 @@ static void PushPreview(int deletedAt)
             offK += g_cacheStrips[t];
         int newFirstStrip = (k == 0) ? StripPxH(g_items[0]->w, g_items[0]->h, true, scale) : 0;
         int newH = oldH - stripK + (k == 0 ? newFirstStrip - stripK : 0);
-        if (k > 0 && newW == (int)g_previewCache->GetWidth() && newH > 0 &&
+        if (newH <= 0)
+        {
+            fullRebuild();          // 删除后无剩余内容，回退全量
+        }
+        else if (k > 0 && newW == (int)g_previewCache->GetWidth() && newH > 0 &&
             newH <= g_previewCacheCapH)
         {
             ShiftRowsInPlace(g_previewCache, offK + stripK, offK,
@@ -1023,17 +1152,12 @@ static void PushPreview(int deletedAt)
             if (k == 0 && !g_cacheStrips.empty())
                 g_cacheStrips[0] = newFirstStrip;
             full = nb;
-            g_previewCacheH = newH;
+            g_previewCacheH = std::max(0, newH);
         }
     }
     else
     {
-        delete g_previewCache;
-        g_previewCache = NULL;
-        full = BuildStitched(960, InterpolationModeBilinear);
-        g_cacheStrips.clear();
-        if (full)
-            g_previewCacheH = (int)full->GetHeight();
+        fullRebuild();
     }
     if (!full)
         return;
@@ -1065,7 +1189,7 @@ static void PushPreview(int deletedAt)
     }
 }
 
-// ---------- actions ----------
+//actions
 
 template <typename Fn>
 static void Guarded(const char* what, Fn&& fn)
@@ -1080,7 +1204,7 @@ static void Guarded(const char* what, Fn&& fn)
     }
 }
 
-static void DeleteItemById(int id)
+static bool EraseItemById(int id)
 {
     for (size_t i = 0; i < g_items.size(); i++)
     {
@@ -1088,10 +1212,18 @@ static void DeleteItemById(int id)
         {
             delete g_items[i];
             g_items.erase(g_items.begin() + i);
-            PushItems();
-            PushPreview((int)i);
-            return;
+            return true;
         }
+    }
+    return false;
+}
+
+static void DeleteItemById(int id)
+{
+    if (EraseItemById(id))
+    {
+        PushItems();
+        PushPreview(0);
     }
 }
 
@@ -1148,7 +1280,7 @@ static void DoSave()
     wchar_t defName[64];
     SYSTEMTIME st;
     GetLocalTime(&st);
-    swprintf_s(defName, L"subtitle_%04d%02d%02d_%02d%02d%02d.png",
+    swprintf_s(defName, L"subtitleshot_%04d%02d%02d_%02d%02d%02d.png",
                (int)st.wYear, (int)st.wMonth, (int)st.wDay,
                (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
     wcscpy_s(path, defName);
@@ -1173,7 +1305,7 @@ static void DoSave()
     delete full;
 }
 
-// ---------- region overlay window ----------
+//region overlay window
 
 static RECT SelRect()
 {
@@ -1472,7 +1604,7 @@ static void OpenRegionSelect()
         ShowWindow(w, SW_SHOW);
 }
 
-// ---------- system theme ----------
+//system theme
 
 static bool ReadSystemLightTheme()
 {
@@ -1498,39 +1630,44 @@ static void ApplySystemTheme()
         ui_theme_set_mode(m);
 }
 
-static WNDPROC g_origWndProc = NULL;
-
 #define TIMER_MARGIN 1
 #define WM_APP_DELETE  (WM_APP + 1)
 #define WM_APP_CAPTURE (WM_APP + 2)
 #define WM_APP_CLEAR   (WM_APP + 3)
+#define WM_APP_REHOVER (WM_APP + 4)
 
 static uint64_t g_lastMarginTs = 0;
 static bool g_marginTimerOn = false;
-static LRESULT SafeCallCoreWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    __try
-    {
-        return g_origWndProc
-                ? g_origWndProc(hwnd, msg, wp, lp)
-                : DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        char buf[192];
-        sprintf_s(buf, "AV in core-ui WndProc (msg=0x%X, w=%llu, l=%llu, code=0x%08X) - swallowed",
-                  msg, (unsigned long long)wp, (unsigned long long)lp,
-                  (unsigned)GetExceptionCode());
-        CrashLogNow(buf);
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-}
+static HWND g_msgWnd = NULL;
 
-static LRESULT CALLBACK ThemeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-if (msg == WM_APP_DELETE)
+    if (msg == WM_APP_DELETE)
     {
-        Guarded("EXCEPTION in deferred delete", [wp]() { DeleteItemById((int)(intptr_t)wp); });
+        // 合并队列中所有堆积的删除请求，防止快速点击时消息堆积导致状态错乱
+        int firstId = (int)(intptr_t)wp;
+        int ids[64];
+        int n = 0;
+        ids[n++] = firstId;
+        MSG peek;
+        while (n < 64 && PeekMessageW(&peek, hwnd, WM_APP_DELETE, WM_APP_DELETE, PM_REMOVE))
+        {
+            int nextId = (int)(intptr_t)peek.wParam;
+            bool dup = false;
+            for (int i = 0; i < n; i++)
+                if (ids[i] == nextId) { dup = true; break; }
+            if (!dup)
+                ids[n++] = nextId;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            int delId = ids[i];
+            Guarded("EXCEPTION in deferred delete-batch", [delId]() { EraseItemById(delId); });
+        }
+        // 批量删除只重建一次列表/预览，避免多次 SetState 换代窗口期间
+        // core-ui 的 hover/更新集合持有被销毁 widget 的悬垂指针
+        PushItems();
+        PushPreview(0);
         return 0;
     }
     if (msg == WM_APP_CAPTURE)
@@ -1541,6 +1678,26 @@ if (msg == WM_APP_DELETE)
     if (msg == WM_APP_CLEAR)
     {
         Guarded("EXCEPTION in deferred clear", DoClear);
+        return 0;
+    }
+    if (msg == WM_APP_REHOVER)
+    {
+        // 重建列表后 hover 集合可能残留已销毁 widget 的悬垂指针，
+        // 用一次真实的鼠标位置命中测试强制 core-ui 刷新 hover/交集状态。
+        if (g_win)
+        {
+            POINT pt;
+            if (GetCursorPos(&pt))
+            {
+                HWND hw = (HWND)ui_window_hwnd(g_win);
+                if (hw)
+                {
+                    ScreenToClient(hw, &pt);
+                    SendMessageW(hw, WM_MOUSEMOVE, 0,
+                                 MAKELPARAM((short)pt.x, (short)pt.y));
+                }
+            }
+        }
         return 0;
     }
     if (msg == WM_TIMER && wp == TIMER_MARGIN)
@@ -1576,36 +1733,6 @@ if (msg == WM_APP_DELETE)
         }
         return 0;
     }
-    LRESULT r;
-    try
-    {
-        r = SafeCallCoreWndProc(hwnd, msg, wp, lp);
-    }
-    catch (const std::exception& e)
-    {
-        char buf[256];
-        sprintf_s(buf, "EXCEPTION from core-ui WndProc (msg=0x%X, w=%llu, l=%llu): %s - swallowed",
-                  msg, (unsigned long long)wp, (unsigned long long)lp, e.what());
-        CrashLogNow(buf);
-        r = DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    catch (...)
-    {
-        char buf[160];
-        sprintf_s(buf, "EXCEPTION from core-ui WndProc (msg=0x%X, w=%llu, l=%llu) [unknown type] - swallowed",
-                  msg, (unsigned long long)wp, (unsigned long long)lp);
-        CrashLogNow(buf);
-        r = DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    if (msg == WM_SETTINGCHANGE)
-        ApplySystemTheme();
-    return r;
-}
-
-// ---------- hotkeys ----------
-
-static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
     if (msg == WM_HOTKEY)
     {
         try
@@ -1621,20 +1748,24 @@ static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    if (msg == WM_SETTINGCHANGE)
+    {
+        ApplySystemTheme();
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ---------- direct widget callbacks (no polling) ----------
+//direct widget callbacks (no polling)
 
 static void ScheduleMarginRebuild()
 {
-    HWND hw = (HWND)ui_window_hwnd(g_win);
-    if (!hw)
+    if (!g_msgWnd)
         return;
     g_lastMarginTs = GetTickCount64();
     if (!g_marginTimerOn)
     {
-        SetTimer(hw, TIMER_MARGIN, 50, NULL);
+        SetTimer(g_msgWnd, TIMER_MARGIN, 50, NULL);
         g_marginTimerOn = true;
     }
 }
@@ -1645,16 +1776,14 @@ static void OnSliderGap(UiWidget, float v, void*)    { g_gap = (int)v;       Pus
 static void OnBtnRegion(UiWidget, void*)  { Guarded("EXCEPTION in OnBtnRegion", OpenRegionSelect); }
 static void OnBtnCapture(UiWidget, void*)
 {
-    HWND hw = (HWND)ui_window_hwnd(g_win);
-    if (hw)
-        PostMessageW(hw, WM_APP_CAPTURE, 0, 0);
+    if (g_msgWnd)
+        PostMessageW(g_msgWnd, WM_APP_CAPTURE, 0, 0);
 }
 static void OnBtnSave(UiWidget, void*)    { Guarded("EXCEPTION in OnBtnSave", DoSave); }
 static void OnBtnClear(UiWidget, void*)
 {
-    HWND hw = (HWND)ui_window_hwnd(g_win);
-    if (hw)
-        PostMessageW(hw, WM_APP_CLEAR, 0, 0);
+    if (g_msgWnd)
+        PostMessageW(g_msgWnd, WM_APP_CLEAR, 0, 0);
 }
 
 static void OnStaticMount(UiPage, UiWidget w, void* ud)
@@ -1677,13 +1806,13 @@ static void OnDelClicked(UiWidget, void* ud)
     static ULONGLONG sLastDelMs = 0;
     static int sLastDelId = -1;
     ULONGLONG now = GetTickCount64();
+    // 仅防同一按钮双击误触，不同按钮之间不限制
     if (id == sLastDelId && now - sLastDelMs < 500)
         return;
     sLastDelMs = now;
     sLastDelId = id;
-    HWND hw = (HWND)ui_window_hwnd(g_win);
-    if (hw)
-        PostMessageW(hw, WM_APP_DELETE, (WPARAM)(intptr_t)id, 0);
+    if (g_msgWnd)
+        PostMessageW(g_msgWnd, WM_APP_DELETE, (WPARAM)(intptr_t)id, 0);
 }
 
 static void OnDelMount(UiPage, UiWidget w, void* ud)
@@ -1735,7 +1864,7 @@ static void TogglePin()
     ApplyPinVisual();
 }
 
-// ---------- entry ----------
+//entry
 
 static int DbgThumbs(char* out, int outSize)
 {
@@ -1918,8 +2047,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _I
     wc.lpszClassName = L"SubMsgClass";
     RegisterClassExW(&wc);
 
-    HWND msgwnd = CreateWindowExW(0, L"SubMsgClass", L"", 0,
-                                  0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    // A hidden top-level tool window receives WM_SETTINGCHANGE broadcasts.
+    HWND msgwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"SubMsgClass", L"", WS_POPUP,
+                                  0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    g_msgWnd = msgwnd;
     RegisterHotKey(msgwnd, HOTKEY_REGION, 0, VK_F8);
     RegisterHotKey(msgwnd, HOTKEY_CAPTURE, 0, VK_F9);
 
@@ -1971,10 +2102,6 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _I
         }
     }
 
-    HWND hw = (HWND)ui_window_hwnd(win);
-    g_origWndProc =
-        (WNDPROC)SetWindowLongPtrW(hw, GWLP_WNDPROC, (LONG_PTR)&ThemeWndProc);
-
     RegisterWidgetCallbacks();
     PushItems();
     PushMarginState();
@@ -1983,9 +2110,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _I
 
     int code = ui_run();
 
-    KillTimer(hw, TIMER_MARGIN);
+    KillTimer(g_msgWnd, TIMER_MARGIN);
     UnregisterHotKey(msgwnd, HOTKEY_REGION);
     UnregisterHotKey(msgwnd, HOTKEY_CAPTURE);
+    DestroyWindow(msgwnd);
+    g_msgWnd = NULL;
     Guarded("EXCEPTION in teardown ui_debug_server_stop", ui_debug_server_stop);
     Guarded("EXCEPTION in teardown ui_page_destroy",
             [&]() { ui_page_destroy(page); });
@@ -1997,6 +2126,13 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _I
                     delete g_items[i];
                 }
                 g_items.clear();
+                {
+                    ui_asset_reset();
+                    std::lock_guard<std::mutex> lk(g_blobsMutex);
+                    std::lock_guard<std::mutex> tlk(g_blobsTrashMutex);
+                    g_blobs.clear();
+                    g_blobsTrash.clear();
+                }
                 FreePreviewCache();
             });
     Guarded("EXCEPTION in teardown GdiplusShutdown",
