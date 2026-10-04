@@ -52,7 +52,8 @@ Debug（vs设置为动态链接）与 Release（vs设置为静态链接）需要
 
 ### 第一步：获取 core-ui
 
-**方式 A（不推荐）：下载预编译 release**
+<details>
+<summary>方式 A（不推荐）：下载预编译 release</summary>
 
 从 [原版果核core-ui Releases](https://github.com/ghboke/core-ui/releases) 下载 `core-ui-v1.7.0-windows-x64.zip`，解压后把 `core-ui-v1.7.0\` 目录放到本仓库根（与 `manualsubtitleshot_coreui.slnx` 同级）即可。包内已含 dynamic（`core-ui.dll` + 导入库）与 static（含 QuickJS / LunaSVG 的 `core-ui.lib`）两套产物。
 
@@ -64,6 +65,7 @@ Debug（vs设置为动态链接）与 Release（vs设置为静态链接）需要
 > 
 > 原版Release不支持用鼠标微调滑块，mod版加上了该功能
 
+</details>
 
 **方式 B：从源码构建**
 
