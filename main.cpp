@@ -2097,6 +2097,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _I
             ui_widget_set_width(g_pinBtn, 36);
             ui_widget_set_height(g_pinBtn, 28);
             ui_icon_button_set_icon_padding(g_pinBtn, 4.0f);
+            ui_widget_set_tooltip(g_pinBtn, L"置顶");
             ui_titlebar_add_widget(tb, g_pinBtn);
             ui_widget_on_click(g_pinBtn, OnPinClicked, NULL);
         }
